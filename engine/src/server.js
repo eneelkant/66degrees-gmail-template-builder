@@ -10,16 +10,25 @@ const { Storage } = require('@google-cloud/storage');
 const cfg = require('./config');
 const { authenticate, requireAdmin, httpError, sha } = require('./auth');
 const { processTemplate } = require('./pipeline');
-const { uploadPage, expiredPage } = require('./uploadPage');
+const { uploadPage, expiredPage, unavailablePage } = require('./uploadPage');
 const { previewPage } = require('./previewPage');
 const { editorPage } = require('./editorPage');
 const { customisePage } = require('./customisePage');
 const { markBlocks, cleanForEmail, cleanLocks, allLocks } = require('./blocks');
-const sharp = require('sharp');
+/* sharp (image tools) loads on first use, so the engine starts faster after a quiet period. */
+let sharpLib = null;
+const sharp = (...args) => {
+  if (!sharpLib) sharpLib = require('sharp');
+  return sharpLib(...args);
+};
 const { fetchImage } = require('./imageImport');
 const { FONTS, backupName } = require('./fonts');
 const { renderThumbnail } = require('./thumbs');
 const cats = require('./categories');
+const teamsLib = require('./teams');
+const { tooBigError } = require('./imageLimit');
+const { sharedList, accessFor, usableHtml, cleanShareList } = require('./sharing');
+const { reducerPage, CSP: REDUCER_CSP } = require('./reducerPage');
 
 const db = new Firestore({ databaseId: cfg.databaseId });
 const bucket = new Storage().bucket(cfg.bucket);
@@ -27,6 +36,7 @@ const templates = db.collection('templates');
 const images = db.collection('images');
 const tickets = db.collection('tickets');
 const categoriesDoc = db.collection('settings').doc('categories');
+const teamsDoc = db.collection('settings').doc('teams');
 const customs = db.collection('custom');
 const CUSTOM_HOURS = 24;
 
@@ -54,15 +64,50 @@ function summary(doc, admin, req) {
     name: d.name,
     category: d.category,
     updatedAt: iso(admin ? d.updatedAt : d.publishedAt || d.updatedAt),
-    thumbUrl: d.thumbUrl || `${baseUrl(req)}/assets/thumb-placeholder.png`
+    thumbUrl: d.thumbUrl || (admin && d.sharedThumbUrl) || `${baseUrl(req)}/assets/thumb-placeholder.png`
   };
   if (admin) {
     out.status = d.status;
     out.version = d.version || 0;
     out.hasUnpublishedChanges = Boolean(d.hasUnpublishedChanges);
     out.updatedBy = d.updatedBy || null;
+    out.sharedWith = sharedList(d);
+    out.sharedStale = Boolean(d.sharedStale) && out.sharedWith.length > 0;
+    out.hidden = Boolean(d.hidden);
   }
   return out;
+}
+
+/* ---------- sharing a template with named people (not everyone) ---------- */
+
+/** Shares the saved template with exactly these people (an empty list stops sharing). */
+async function shareFor(email, id, people) {
+  const list = cleanShareList(people);
+  const doc = await getTemplate(id);
+  const d = doc.data();
+  if (d.status === 'published') throw httpError(409, 'This template is already published for everyone, so everyone can use it.');
+  if (!list.length) {
+    await doc.ref.update({ sharedWith: [], sharedStale: false, sharedHtml: FieldValue.delete(), sharedLocks: FieldValue.delete(), sharedAt: FieldValue.delete(), sharedBy: FieldValue.delete() });
+    return { id: doc.id, sharedWith: [] };
+  }
+  const result = processTemplate(d.sourceHtml);
+  if (result.hasErrors) {
+    await doc.ref.update({ checks: result.checks, draftHtml: result.html });
+    throw httpError(422, 'Fix the problems marked in the Gmail check, then share again.', { checks: result.checks });
+  }
+  await doc.ref.update({
+    sharedWith: list,
+    sharedHtml: result.html,
+    draftHtml: result.html,
+    checks: result.checks,
+    sharedLocks: d.locks || [],
+    sharedStale: false,
+    sharedBy: email,
+    sharedAt: FieldValue.serverTimestamp()
+  });
+  console.log(`Template "${d.name}" (${doc.id}) shared by ${email} with ${list.length} people`);
+  sharedThumbLater(doc.id, result.html);
+  return { id: doc.id, sharedWith: list, checks: result.checks };
 }
 
 function cleanName(v) {
@@ -85,9 +130,41 @@ function cleanCategory(v, list) {
   return hit.name;
 }
 
-/** What the sidebar needs: admins get every category, users only the ones switched on. */
-function categoriesFor(user, list) {
-  return user.isAdmin ? list : list.filter((c) => c.visible);
+async function loadTeams() {
+  const doc = await teamsDoc.get();
+  return teamsLib.normalise(doc.exists ? doc.data().list : null);
+}
+
+/** Categories and teams together: everything needed to decide who sees what. */
+async function loadAccess() {
+  const [list, teams] = await Promise.all([loadCategories(), loadTeams()]);
+  return { list, teams };
+}
+
+/**
+ * Can this person see templates in this category?
+ * Admins: always. View as user: any category given to someone. Users: everyone, their email, or their team.
+ */
+function seesCategory(user, access, category) {
+  if (user.isAdmin) return true;
+  if (user.viewingAsUser) return cats.hasAudience(cats.findCategory(access.list, category));
+  return cats.canSee(access.list, category, user.email, access.teams);
+}
+
+/** What the sidebar needs: admins get every category, users only the ones they can see. */
+function categoriesFor(user, access) {
+  return access.list.filter((c) => seesCategory(user, access, c.name));
+}
+
+/** Who a category is seen by, in words (for admins). */
+function audienceText(c, teams) {
+  if (c.visible) return 'Everyone';
+  const names = (c.teams || []).map((id) => teams.find((t) => t.id === id)).filter(Boolean).map((t) => t.name);
+  const people = (c.people || []).length;
+  const parts = [];
+  if (names.length) parts.push(names.length === 1 ? `${names[0]} team` : `${names.length} teams`);
+  if (people) parts.push(`${people} ${people === 1 ? 'person' : 'people'}`);
+  return parts.length ? parts.join(' + ') : 'Admins only';
 }
 
 async function getTemplate(id) {
@@ -128,11 +205,19 @@ async function updateTicket(value, fields) {
 
 app.get('/health', (req, res) => res.json({ ok: true }));
 
+/* ---------- image reducer (runs in the browser; no sign-in needed) ---------- */
+
+app.get('/reducer', (req, res) => {
+  res.set('Cache-Control', 'public, max-age=300');
+  res.set('Content-Security-Policy', REDUCER_CSP);
+  res.type('html').send(reducerPage());
+});
+
 /* ---------- who am I ---------- */
 
 app.get('/api/me', authenticate, (req, res) => {
-  loadCategories()
-    .then((list) => res.json({ email: req.user.email, isAdmin: req.user.isAdmin, categories: categoriesFor(req.user, list).map((c) => c.name) }))
+  loadAccess()
+    .then((access) => res.json({ email: req.user.email, isAdmin: req.user.isAdmin, categories: categoriesFor(req.user, access).map((c) => c.name) }))
     .catch((err) => { console.error(err); res.status(500).json({ error: 'Something went wrong. Try again.' }); });
 });
 
@@ -140,11 +225,14 @@ app.get('/api/me', authenticate, (req, res) => {
 
 app.get('/api/templates', authenticate, wrap(async (req, res) => {
   const admin = req.user.isAdmin;
-  const fields = ['name', 'category', 'updatedAt', 'publishedAt', 'thumbUrl', 'thumbVersion', 'version', 'status'];
+  const fields = ['name', 'category', 'updatedAt', 'publishedAt', 'thumbUrl', 'thumbVersion', 'version', 'status', 'sharedWith', 'sharedBy', 'sharedAt', 'sharedThumbUrl', 'hidden'];
+  const me = String(req.user.email || '').toLowerCase();
   const query = admin
-    ? templates.select(...fields, 'hasUnpublishedChanges', 'updatedBy')
+    ? templates.select(...fields, 'hasUnpublishedChanges', 'updatedBy', 'sharedStale')
     : templates.where('status', '==', 'published').select(...fields);
-  const [snap, list, custom] = await Promise.all([query.get(), loadCategories(), loadCustom(req.user.email)]);
+  const sharedQuery = admin ? null : templates.where('sharedWith', 'array-contains', me).select(...fields);
+  const [snap, sharedSnap, access, custom] = await Promise.all([query.get(), sharedQuery ? sharedQuery.get() : null, loadAccess(), loadCustom(req.user.email)]);
+  const list = access.list;
 
   snap.docs.forEach((d) => {
     const x = d.data();
@@ -153,32 +241,71 @@ app.get('/api/templates', authenticate, wrap(async (req, res) => {
 
   const q = String(req.query.q || '').trim().toLowerCase();
   const category = String(req.query.category || '').trim().toLowerCase();
+  const matches = (t) => (!q || t.name.toLowerCase().includes(q) || t.category.toLowerCase().includes(q));
   const items = snap.docs
+    .filter((d) => admin || !d.data().hidden)
     .map((d) => summary(d, admin, req))
-    .filter((t) => admin || cats.isVisible(list, t.category))
-    .filter((t) => !q || t.name.toLowerCase().includes(q) || t.category.toLowerCase().includes(q))
-    .filter((t) => !category || t.category.toLowerCase() === category)
+    .filter((t) => seesCategory(req.user, access, t.category))
+    .filter(matches)
+    .filter((t) => !category || ['shared', 'drafts', 'hidden'].includes(category) || t.category.toLowerCase() === category)
+    .filter((t) => category !== 'hidden' || t.hidden)
+    .filter((t) => category !== 'shared' || (t.sharedWith && t.sharedWith.length))
+    .filter((t) => category !== 'drafts' || (t.status !== 'published' && !(t.sharedWith && t.sharedWith.length)))
     .sort((a, b) => a.category.localeCompare(b.category) || a.name.localeCompare(b.name));
-  res.json({ custom: custom ? { templateId: custom.templateId, name: custom.name, changes: custom.changes || 0 } : null, templates: items, isAdmin: admin, realAdmin: Boolean(req.user.realAdmin), viewingAsUser: Boolean(req.user.viewingAsUser), categories: categoriesFor(req.user, list) });
+
+  /* Templates shared with this person by name (users only; admins already see everything). */
+  const sharedWithMe = (sharedSnap ? sharedSnap.docs : [])
+    .filter((d) => accessFor(d.data(), req.user) === 'shared')
+    .map((d) => ({
+      ...summary(d, false, req),
+      thumbUrl: d.data().sharedThumbUrl || `${baseUrl(req)}/assets/thumb-placeholder.png`,
+      sharedBy: d.data().sharedBy || '',
+      sharedAt: iso(d.data().sharedAt)
+    }))
+    .filter(matches);
+
+  res.json({ custom: custom ? { templateId: custom.templateId, name: custom.name, changes: custom.changes || 0 } : null, templates: items, sharedWithMe, isAdmin: admin, realAdmin: Boolean(req.user.realAdmin), viewingAsUser: Boolean(req.user.viewingAsUser), categories: categoriesFor(req.user, access), hiddenCount: admin ? snap.docs.filter((d) => d.data().hidden).length : undefined });
 }));
 
 app.get('/api/templates/:id', authenticate, wrap(async (req, res) => {
   const doc = await getTemplate(req.params.id);
   const d = doc.data();
-  const list = await loadCategories();
+  const all = await loadAccess();
+  const list = all.list;
   if (!req.user.isAdmin) {
-    if (d.status !== 'published' || !cats.isVisible(list, d.category)) throw httpError(404, 'Template not found.');
-    return res.json({ id: doc.id, name: d.name, category: d.category, html: cleanForEmail(d.publishedHtml) });
+    const access = accessFor(d, req.user);
+    if (!access || (access === 'published' && !seesCategory(req.user, all, d.category))) throw httpError(404, 'Template not found.');
+    return res.json({ id: doc.id, name: d.name, category: d.category, shared: access === 'shared', html: cleanForEmail(usableHtml(d, access)) });
   }
-  res.json({
+  res.json(adminTemplate(doc, req, list, req.query.lite === '1'));
+}));
+
+/**
+ * What an admin sees about one template. lite = the template page in Gmail:
+ * everything except the (large) code, so the panel loads faster.
+ */
+function adminTemplate(doc, req, list, lite) {
+  const d = doc.data();
+  const out = {
     ...summary(doc, true, req),
     categories: list,
-    html: d.publishedHtml ? cleanForEmail(d.publishedHtml) : null,
-    sourceHtml: d.sourceHtml || '',
-    draftHtml: d.draftHtml || '',
+    sharedBy: d.sharedBy || null,
+    sharedAt: iso(d.sharedAt),
     checks: d.checks || []
-  });
-}));
+  };
+  if (!lite) {
+    out.html = d.publishedHtml ? cleanForEmail(d.publishedHtml) : null;
+    out.sourceHtml = d.sourceHtml || '';
+    out.draftHtml = d.draftHtml || '';
+  }
+  return out;
+}
+
+/** The template page's data after an action, so Gmail needs no second call. */
+async function freshTemplate(id, req) {
+  const [doc, list] = await Promise.all([getTemplate(id), loadCategories()]);
+  return adminTemplate(doc, req, list, true);
+}
 
 app.post('/api/preview-ticket', authenticate, wrap(async (req, res) => {
   const body = req.body || {};
@@ -186,10 +313,11 @@ app.post('/api/preview-ticket', authenticate, wrap(async (req, res) => {
   const d = doc.data();
   const draft = Boolean(body.draft);
   if (draft && !req.user.isAdmin) throw httpError(403, 'Only template admins can preview drafts.');
-  if (!draft && d.status !== 'published') throw httpError(404, 'Template not found.');
-  if (!req.user.isAdmin && !cats.isVisible(await loadCategories(), d.category)) throw httpError(404, 'Template not found.');
+  const access = draft ? null : accessFor(d, req.user, { admin: req.user.isAdmin });
+  if (!draft && !access) throw httpError(404, 'Template not found.');
+  if (!req.user.isAdmin && access === 'published' && !seesCategory(req.user, await loadAccess(), d.category)) throw httpError(404, 'Template not found.');
   if (draft && !d.draftHtml) throw httpError(400, 'Save the template first, then preview it.');
-  const ticket = await createTicket('preview', { email: req.user.email, templateId: doc.id, draft }, 30);
+  const ticket = await createTicket('preview', { email: req.user.email, templateId: doc.id, draft, shared: access === 'shared', admin: Boolean(req.user.isAdmin) }, 30);
   res.json({ url: `${baseUrl(req)}/preview?ticket=${ticket}` });
 }));
 
@@ -201,8 +329,9 @@ app.get('/preview', wrap(async (req, res) => {
   const doc = await templates.doc(ticket.templateId).get();
   if (!doc.exists) return res.status(404).type('html').send(expiredPage('preview'));
   const d = doc.data();
-  const html = ticket.draft ? d.draftHtml : d.publishedHtml;
-  if (!html || (!ticket.draft && d.status !== 'published')) return res.status(404).type('html').send(expiredPage('preview'));
+  const access = ticket.draft ? null : accessFor(d, { email: ticket.email }, { admin: Boolean(ticket.admin) });
+  const html = ticket.draft ? d.draftHtml : access ? usableHtml(d, access) : null;
+  if (!html) return res.status(404).type('html').send(ticket.draft ? expiredPage('preview') : unavailablePage());
   res.type('html').send(previewPage({ name: d.name, category: d.category, html, draft: ticket.draft }));
 }));
 
@@ -266,9 +395,14 @@ async function saveTemplateFor(email, body) {
   let hasUnpublishedChanges = false;
   if (id) {
     const existing = await getTemplate(id);
-    status = existing.data().status || 'draft';
+    const ed = existing.data();
+    status = ed.status || 'draft';
     hasUnpublishedChanges = status === 'published';
-    await existing.ref.update({ ...fields, hasUnpublishedChanges });
+    /* Shared with named people: they keep the copy they were given until it is shared again. */
+    const shared = sharedList(ed).length > 0;
+    const newLocks = lockFields.locks || ed.locks || [];
+    const sharedStale = shared && (result.html !== ed.sharedHtml || JSON.stringify(newLocks) !== JSON.stringify(ed.sharedLocks || []));
+    await existing.ref.update({ ...fields, hasUnpublishedChanges, sharedStale });
   } else {
     const ref = await templates.add({
       ...fields,
@@ -280,7 +414,12 @@ async function saveTemplateFor(email, body) {
     });
     id = ref.id;
   }
-  return { id, status, hasUnpublishedChanges, checks: result.checks, hasErrors: result.hasErrors, html: result.html, locks: lockFields.locks, updatedAtMs: await updatedAtMs(id) };
+  const after = (await templates.doc(id).get()).data() || {};
+  return {
+    id, status, hasUnpublishedChanges, checks: result.checks, hasErrors: result.hasErrors, html: result.html, locks: lockFields.locks,
+    sharedWith: sharedList(after), sharedStale: Boolean(after.sharedStale),
+    updatedAtMs: after.updatedAt && after.updatedAt.toMillis ? after.updatedAt.toMillis() : Date.now()
+  };
 }
 
 app.post('/api/templates', authenticate, requireAdmin, wrap(async (req, res) => {
@@ -309,13 +448,33 @@ function refreshThumb(id, version) {
     .catch((err) => console.warn('Thumbnail check failed for', id, err.message));
 }
 
+/** Thumbnail of the copy shared with named people (made in the background, like the published one). */
+function sharedThumbLater(id, html) {
+  const key = `${id}:shared:${crypto.createHash('sha256').update(html).digest('hex').slice(0, 12)}`;
+  if (thumbsInProgress.has(key)) return;
+  thumbsInProgress.add(key);
+  renderThumbnail(html)
+    .then(async (png) => {
+      const objectName = `thumbs/${id}-shared-${crypto.randomBytes(3).toString('hex')}.jpg`;
+      await bucket.file(objectName).save(png, {
+        resumable: false,
+        contentType: 'image/jpeg',
+        metadata: { cacheControl: 'public, max-age=31536000, immutable' },
+        preconditionOpts: { ifGenerationMatch: 0 }
+      });
+      await templates.doc(id).update({ sharedThumbUrl: `${cfg.libraryPrefix}${objectName}` });
+    })
+    .catch((err) => console.warn('Shared thumbnail failed for', id, err.message))
+    .finally(() => thumbsInProgress.delete(key));
+}
+
 async function makeThumbnail(id, version, html) {
   try {
     const png = await renderThumbnail(html);
-    const objectName = `thumbs/${id}-v${version}-${crypto.randomBytes(3).toString('hex')}.png`;
+    const objectName = `thumbs/${id}-v${version}-${crypto.randomBytes(3).toString('hex')}.jpg`;
     await bucket.file(objectName).save(png, {
       resumable: false,
-      contentType: 'image/png',
+      contentType: 'image/jpeg',
       metadata: { cacheControl: 'public, max-age=31536000, immutable' },
       preconditionOpts: { ifGenerationMatch: 0 }
     });
@@ -348,6 +507,9 @@ async function publishFor(email, id, options) {
       draftHtml: result.html,
       checks: result.checks,
       hasUnpublishedChanges: false,
+      /* Published for everyone: the named-people list is no longer needed. */
+      sharedWith: [],
+      sharedStale: false,
       publishedBy: email,
       publishedAt: FieldValue.serverTimestamp(),
       updatedAt: FieldValue.serverTimestamp(),
@@ -373,7 +535,14 @@ async function publishFor(email, id, options) {
 }
 
 app.post('/api/templates/:id/publish', authenticate, requireAdmin, wrap(async (req, res) => {
-  res.json(await publishFor(req.user.email, req.params.id));
+  const out = await publishFor(req.user.email, req.params.id);
+  res.json({ ...out, template: await freshTemplate(req.params.id, req) });
+}));
+
+/* body: { people: ['name@66degrees.com', ...] } — exactly who it is shared with; [] stops sharing */
+app.post('/api/templates/:id/share', authenticate, requireAdmin, wrap(async (req, res) => {
+  const out = await shareFor(req.user.email, req.params.id, (req.body || {}).people);
+  res.json({ ...out, template: await freshTemplate(req.params.id, req) });
 }));
 
 app.post('/api/templates/:id/unpublish', authenticate, requireAdmin, wrap(async (req, res) => {
@@ -383,7 +552,7 @@ app.post('/api/templates/:id/unpublish', authenticate, requireAdmin, wrap(async 
     updatedAt: FieldValue.serverTimestamp(),
     updatedBy: req.user.email
   });
-  res.json({ id: doc.id, status: 'unpublished' });
+  res.json({ id: doc.id, status: 'unpublished', template: await freshTemplate(doc.id, req) });
 }));
 
 app.post('/api/templates/:id/delete', authenticate, requireAdmin, wrap(async (req, res) => {
@@ -429,7 +598,7 @@ app.post('/api/templates/:id/copy', authenticate, requireAdmin, wrap(async (req,
     updatedBy: req.user.email,
     updatedAt: FieldValue.serverTimestamp()
   });
-  res.json({ id: ref.id, name });
+  res.json({ id: ref.id, name, template: await freshTemplate(ref.id, req) });
 }));
 
 app.get('/api/templates/:id/versions', authenticate, requireAdmin, wrap(async (req, res) => {
@@ -462,7 +631,7 @@ app.post('/api/templates/:id/restore', authenticate, requireAdmin, wrap(async (r
     updatedAt: FieldValue.serverTimestamp()
   });
   const out = await publishFor(req.user.email, doc.id, { restoredFrom: n });
-  res.json({ ...out, restoredFrom: n });
+  res.json({ ...out, restoredFrom: n, template: await freshTemplate(doc.id, req) });
 }));
 
 /* ---------- full-size editor window: admins ---------- */
@@ -498,10 +667,12 @@ app.get('/editor', wrap(async (req, res) => {
       locks: d.locks || [],
       mode: d.mode || (d.blocks ? 'blocks' : 'html'),
       blocks: d.blocks ? safeParse(d.blocks) : null,
+      sharedWith: sharedList(d),
+      sharedStale: Boolean(d.sharedStale),
       updatedAtMs: d.updatedAt && d.updatedAt.toMillis ? d.updatedAt.toMillis() : 0
     };
   }
-  res.type('html').send(editorPage({ ticket: req.query.ticket, template, categories: list, fonts: FONTS.map((f) => ({ name: f.name, stack: f.stack, web: Boolean(f.web), backup: backupName(f) })), libraryPrefix: cfg.libraryPrefix }));
+  res.type('html').send(editorPage({ ticket: req.query.ticket, template, categories: list, fonts: FONTS.map((f) => ({ name: f.name, stack: f.stack, web: Boolean(f.web), backup: backupName(f) })), libraryPrefix: cfg.libraryPrefix, domain: cfg.domain }));
 }));
 
 function safeParse(json) {
@@ -540,6 +711,16 @@ app.post('/editor/publish', wrap(async (req, res) => {
     throw httpError(422, 'Saved, but fix the problems marked in the Gmail check before publishing.', { checks: saved.checks });
   }
   res.json(await publishFor(ticket.email, saved.id));
+}));
+
+/* body: the editor's template + people: [...] — saves, then shares with exactly those people */
+app.post('/editor/share', wrap(async (req, res) => {
+  const { ticket, saved } = await editorSave(req);
+  if (saved.hasErrors && (req.body.people || []).length) {
+    throw httpError(422, 'Saved, but fix the problems marked in the Gmail check before sharing.', { checks: saved.checks });
+  }
+  const out = await shareFor(ticket.email, saved.id, req.body.people);
+  res.json({ ...saved, ...out, sharedStale: false, updatedAtMs: await updatedAtMs(saved.id) });
 }));
 
 /* ---------- block builder: images (admins, from the editor tab) ---------- */
@@ -595,7 +776,7 @@ app.post('/editor/upload', wrap(async (req, res) => {
   await new Promise((resolve, reject) => {
     receivePhoto(req, res, (err) => {
       if (!err) return resolve();
-      if (err.code === 'LIMIT_FILE_SIZE') return reject(httpError(413, 'That image is over 10 MB. Make it smaller and try again.'));
+      if (err.code === 'LIMIT_FILE_SIZE') return reject(tooBigError(httpError, Number(req.headers['content-length']) || 0));
       reject(httpError(400, 'The upload could not be read. Try again.'));
     });
   });
@@ -662,6 +843,7 @@ app.post('/editor/import', wrap(async (req, res) => {
   try {
     got = await fetchImage(source);
   } catch (e) {
+    if (e.status === 413) throw httpError(413, `${e.message} Download it, make it smaller with the image reducer, then click Upload.`, { tooBig: true, size: e.size || null });
     throw httpError(e.status || 502, e.message);
   }
   let buffer = got.buffer;
@@ -695,9 +877,10 @@ async function loadCustom(email) {
 app.post('/api/customise-ticket', authenticate, wrap(async (req, res) => {
   const doc = await getTemplate(req.body && req.body.id);
   const d = doc.data();
-  if (d.status !== 'published' || !d.publishedHtml) throw httpError(404, 'This template is not published yet.');
-  if (!req.user.isAdmin && !cats.isVisible(await loadCategories(), d.category)) throw httpError(404, 'Template not found.');
-  const ticket = await createTicket('customise', { email: req.user.email, templateId: doc.id }, 120);
+  const access = accessFor(d, req.user, { admin: req.user.isAdmin });
+  if (!access) throw httpError(404, d.hidden ? 'This template isn\u2019t available.' : 'This template is not published yet.');
+  if (!req.user.isAdmin && access === 'published' && !seesCategory(req.user, await loadAccess(), d.category)) throw httpError(404, 'Template not found.');
+  const ticket = await createTicket('customise', { email: req.user.email, templateId: doc.id, admin: Boolean(req.user.isAdmin) }, 120);
   res.json({ url: `${baseUrl(req)}/customise?ticket=${ticket}` });
 }));
 
@@ -709,16 +892,17 @@ app.get('/customise', wrap(async (req, res) => {
   const ticket = await readTicket(req.query.ticket, 'customise');
   if (!ticket) return res.status(410).type('html').send(expiredPage('customise'));
   const doc = await templates.doc(ticket.templateId).get();
-  if (!doc.exists || doc.data().status !== 'published') return res.status(404).type('html').send(expiredPage('customise'));
+  const access = doc.exists ? accessFor(doc.data(), { email: ticket.email }, { admin: Boolean(ticket.admin) }) : null;
+  if (!access) return res.status(404).type('html').send(unavailablePage());
   const d = doc.data();
-  const marked = markBlocks(d.publishedHtml);
+  const marked = markBlocks(usableHtml(d, access));
   res.type('html').send(customisePage({
     ticket: req.query.ticket,
     name: d.name,
     category: d.category,
     html: marked.html,
     blocks: marked.blocks,
-    locks: allLocks(d.locks, marked.blocks)
+    locks: allLocks(access === 'shared' ? d.sharedLocks : d.locks, marked.blocks)
   }));
 }));
 
@@ -736,7 +920,7 @@ app.post('/customise/image', wrap(async (req, res) => {
   await new Promise((resolve, reject) => {
     receivePhoto(req, res, (err) => {
       if (!err) return resolve();
-      if (err.code === 'LIMIT_FILE_SIZE') return reject(httpError(413, 'That photo is over 10 MB. Choose a smaller one.'));
+      if (err.code === 'LIMIT_FILE_SIZE') return reject(tooBigError(httpError, Number(req.headers['content-length']) || 0));
       reject(httpError(400, 'The photo could not be read. Try again.'));
     });
   });
@@ -812,13 +996,73 @@ app.post('/api/custom/discard', authenticate, wrap(async (req, res) => {
 /* ---------- categories: admins ---------- */
 
 app.get('/api/categories', authenticate, requireAdmin, wrap(async (req, res) => {
-  const [list, snap] = await Promise.all([loadCategories(), templates.select('category').get()]);
+  const [access, snap] = await Promise.all([loadAccess(), templates.select('category').get()]);
+  res.json(categoriesReply(access, snap));
+}));
+
+function categoriesReply(access, snap) {
   const counts = {};
   snap.docs.forEach((d) => {
     const key = String(d.data().category || '').toLowerCase();
     counts[key] = (counts[key] || 0) + 1;
   });
-  res.json({ categories: list.map((c) => ({ ...c, count: counts[c.name.toLowerCase()] || 0 })) });
+  const teams = access.teams;
+  return {
+    categories: access.list.map((c) => ({
+      ...c,
+      teams: (c.teams || []).filter((id) => teams.some((t) => t.id === id)),
+      count: counts[c.name.toLowerCase()] || 0,
+      audience: audienceText(c, teams)
+    })),
+    teams: teams.map((t) => ({ id: t.id, name: t.name, members: t.members }))
+  };
+}
+
+/* ---------- teams: admins ---------- */
+
+function teamsReply(teams, list) {
+  return {
+    teams: teams.map((t) => ({
+      ...t,
+      categories: list.filter((c) => !c.visible && (c.teams || []).includes(t.id)).map((c) => c.name)
+    }))
+  };
+}
+
+app.get('/api/teams', authenticate, requireAdmin, wrap(async (req, res) => {
+  const access = await loadAccess();
+  res.json(teamsReply(access.teams, access.list));
+}));
+
+/* body (one at a time): { create }, { rename: { id, name } }, { remove: { id } }, { addMembers: { id, emails } }, { removeMember: { id, email } } */
+app.post('/api/teams', authenticate, requireAdmin, wrap(async (req, res) => {
+  const body = req.body || {};
+  const out = await db.runTransaction(async (tx) => {
+    const [tDoc, cDoc] = await Promise.all([tx.get(teamsDoc), tx.get(categoriesDoc)]);
+    const before = teamsLib.normalise(tDoc.exists ? tDoc.data().list : null);
+    const { list, created } = teamsLib.applyChanges(before, body);
+    tx.set(teamsDoc, { list, updatedBy: req.user.email, updatedAt: FieldValue.serverTimestamp() });
+    let categoryList = cats.normalise(cDoc.exists ? cDoc.data().list : null);
+    /* A deleted team is taken off every category too. */
+    if (body.remove && categoryList.some((c) => (c.teams || []).includes(body.remove.id))) {
+      categoryList = categoryList.map((c) => ({ ...c, teams: (c.teams || []).filter((id) => id !== body.remove.id) }));
+      tx.set(categoriesDoc, { list: categoryList, updatedBy: req.user.email, updatedAt: FieldValue.serverTimestamp() });
+    }
+    return { list, created, categoryList };
+  });
+  console.log(`Teams changed by ${req.user.email}: ${Object.keys(body).join(', ')}`);
+  res.json({ ...teamsReply(out.list, out.categoryList), created: out.created ? out.created.id : null });
+}));
+
+/* ---------- hiding a template (admins still see it) ---------- */
+
+/* body: { hidden: true|false } */
+app.post('/api/templates/:id/hidden', authenticate, requireAdmin, wrap(async (req, res) => {
+  const doc = await getTemplate(req.params.id);
+  const hidden = Boolean(req.body && req.body.hidden);
+  await doc.ref.update({ hidden, hiddenBy: req.user.email, hiddenAt: FieldValue.serverTimestamp() });
+  console.log(`Template "${doc.data().name}" (${doc.id}) ${hidden ? 'hidden' : 'shown again'} by ${req.user.email}`);
+  res.json({ hidden, template: await freshTemplate(doc.id, req) });
 }));
 
 /* Templates in a category: moved when a category is renamed or deleted. */
@@ -834,7 +1078,8 @@ async function moveTemplates(fromName, toName) {
 
 /*
  * body (one at a time):
- *   { set: { name, visible } }        switch one category on or off
+ *   { set: { name, visible } }        switch one category on or off (older add-on versions)
+ *   { audience: { name, everyone, teams: [ids], people: [emails] } }   who can see it
  *   { add: 'New name' }               add a category
  *   { rename: { from, to } }          rename (its templates follow)
  *   { remove: { name, moveTo } }      delete; templates in it move to moveTo
@@ -856,6 +1101,8 @@ app.post('/api/categories', authenticate, requireAdmin, wrap(async (req, res) =>
     }
   }
   let renamed = null;
+  const teams = await loadTeams();
+  if (body.audience && typeof body.audience === 'object') body.audience.knownTeams = teams.map((t) => t.id);
   const list = await db.runTransaction(async (tx) => {
     const doc = await tx.get(categoriesDoc);
     const before = cats.normalise(doc.exists ? doc.data().list : null);
@@ -869,35 +1116,45 @@ app.post('/api/categories', authenticate, requireAdmin, wrap(async (req, res) =>
     return next;
   });
   if (renamed && renamed.from !== renamed.to) await moveTemplates(renamed.from, renamed.to);
-  res.json({ categories: list });
+  if (body.audience) console.log(`Category "${body.audience.name}" audience changed by ${req.user.email}`);
+  res.json(categoriesReply({ list, teams }, await templates.select('category').get()));
 }));
 
 /* ---------- images: admins ---------- */
 
+/** Which templates use each image link (looks at the saved, published and shared code). */
+async function imageUsage() {
+  const snap = await templates.select('name', 'sourceHtml', 'publishedHtml', 'sharedHtml').get();
+  return snap.docs.map((t) => ({ name: t.data().name, code: `${t.data().sourceHtml || ''} ${t.data().publishedHtml || ''} ${t.data().sharedHtml || ''}` }));
+}
+
+function usedInFor(usage, url) {
+  return url ? usage.filter((t) => t.code.includes(url)).map((t) => t.name).sort((a, b) => a.localeCompare(b)) : [];
+}
+
 app.get('/api/images', authenticate, requireAdmin, wrap(async (req, res) => {
-  const snap = await images.orderBy('uploadedAt', 'desc').limit(200).get();
+  const [snap, usage] = await Promise.all([images.orderBy('uploadedAt', 'desc').limit(200).get(), imageUsage()]);
   const q = String(req.query.q || '').trim().toLowerCase();
   const items = snap.docs
-    .map((d) => ({ id: d.id, name: d.data().name, url: d.data().url, size: d.data().size, uploadedAt: iso(d.data().uploadedAt) }))
+    .map((d) => ({ id: d.id, name: d.data().name, url: d.data().url, size: d.data().size, uploadedAt: iso(d.data().uploadedAt), uploadedBy: d.data().uploadedBy || '', usedIn: usedInFor(usage, d.data().url) }))
     .filter((i) => !q || i.name.toLowerCase().includes(q));
   res.json({ images: items });
 }));
 
-/* Removes an image from the library list. The file itself stays online, so emails already sent with it never break. */
+/*
+ * Deletes an image from the library list, even when templates use it.
+ * The file itself stays online, so templates, their old versions, people's
+ * customised copies and emails already sent keep showing the picture.
+ */
 app.post('/api/images/remove', authenticate, requireAdmin, wrap(async (req, res) => {
   const id = String((req.body && req.body.id) || '');
   if (!id) throw httpError(400, 'Choose an image.');
   const doc = await images.doc(id).get();
-  if (!doc.exists) throw httpError(404, 'That image is already gone. Click Refresh.');
-  const url = doc.data().url;
-  const snap = await templates.select('sourceHtml', 'publishedHtml', 'name').get();
-  const usedIn = snap.docs.filter((t) => `${t.data().sourceHtml || ''} ${t.data().publishedHtml || ''}`.includes(url)).map((t) => t.data().name);
-  if (usedIn.length) {
-    throw httpError(409, `This image is used in ${usedIn.slice(0, 3).map((n) => `"${n}"`).join(', ')}${usedIn.length > 3 ? ` and ${usedIn.length - 3} more` : ''}. Change those templates first.`, { usedIn });
-  }
+  if (!doc.exists) throw httpError(404, 'That image is already gone.');
+  const usedIn = usedInFor(await imageUsage(), doc.data().url);
   await doc.ref.delete();
-  console.log(`Image ${doc.data().name} removed from the library by ${req.user.email}`);
-  res.json({ ok: true, name: doc.data().name });
+  console.log(`Image ${doc.data().name} removed from the library by ${req.user.email} (used in ${usedIn.length} templates; the file stays online)`);
+  res.json({ ok: true, name: doc.data().name, usedIn });
 }));
 
 app.post('/api/upload-ticket', authenticate, requireAdmin, wrap(async (req, res) => {
@@ -949,7 +1206,7 @@ app.post('/upload', wrap(async (req, res) => {
   await new Promise((resolve, reject) => {
     receive(req, res, (err) => {
       if (!err) return resolve();
-      if (err.code === 'LIMIT_FILE_SIZE') return reject(httpError(413, 'That image is over 10 MB. Make it smaller and try again.'));
+      if (err.code === 'LIMIT_FILE_SIZE') return reject(tooBigError(httpError, Number(req.headers['content-length']) || 0));
       reject(httpError(400, 'The upload could not be read. Try again.'));
     });
   });
@@ -959,12 +1216,7 @@ app.post('/upload', wrap(async (req, res) => {
   if (!kind) throw httpError(415, 'Only JPG, PNG or GIF images can be uploaded.');
 
   const { objectName, url } = await storeLibraryImage(req.file.buffer, req.file.originalname, kind, ticket.email);
-  res.json({
-    name: objectName,
-    url,
-    size: req.file.size,
-    warning: req.file.size > cfg.warnImageBytes ? 'Uploaded. This image is over 1 MB, so it may load slowly in emails, especially on phones.' : null
-  });
+  res.json({ name: objectName, url, size: req.file.size, warning: null });
 }));
 
 /* ---------- errors ---------- */

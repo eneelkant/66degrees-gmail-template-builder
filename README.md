@@ -45,16 +45,22 @@
 | 🖱️ **Edit in preview** | Click any text, button, picture or row: fonts (39), sizes 10–72, colours, alignment, links, button styles |
 | 🧱 **Rows** | Add, drag, move, copy, delete, set background and spacing; add the **66degrees header** or **footer** row in one click |
 | 🔒 **Locks** | Lock any part or a whole row; users can't change it when customising |
-| 🖼️ **Image library** | Upload, pick, **copy into library** from other sites, cut to shapes (1:1, 4:5, 16:9…), safe remove |
+| 🖼️ **Image library** | Upload (up to **1 MB**), pick, **copy into library** from other sites, cut to shapes (1:1, 4:5, 16:9…), see where each image is used, delete safely |
+| 🪄 **Image reducer** | Too-big image? A red message offers **Reduce it here**: a built-in page that makes a copy under 1 MB right in the browser (or use Google Squoosh) |
+| 🤝 **Share with people** | Give a draft to named colleagues only; it shows under **Shared with you** for them and nobody else |
 | ↩️ **Undo, redo & versions** | Last 50 changes, `Cmd + Z`; every publish is kept and can be **restored** |
-| 👥 **Teamwork** | Make a copy, categories (show/hide, rename, delete), a warning when two admins save the same template |
+| 👥 **Teamwork** | Make a copy, categories (rename, delete), a warning when two admins save the same template |
+| 🎯 **Who sees what** | Make **Teams** (named lists of people) and give each category to everyone, or only to chosen teams and single email addresses. New categories start as admins only |
+| 🙈 **Hidden switch** | Hide any template (published, draft or shared) from users and the people it's shared with. Admins always see it, under a **Hidden** filter |
 | ⚡ **Fast publish** | Live in a few seconds; the gallery thumbnail is made in the background |
+| 🔗 **Link count** | The Gmail check tells you how many links a template has (information only) |
 
 ### For every 66er
 
 | | |
 |---|---|
-| 📚 **Gallery** | Categories and thumbnails in Gmail's side panel and Compose box |
+| 📚 **Gallery** | Category chips and thumbnails in Gmail's side panel and Compose box |
+| 🤝 **Shared with you** | Templates an admin shared with you by name, shown first |
 | 👀 **Preview** | Desktop and mobile |
 | ✏️ **Customise** | Retype text, swap photos (always fitted to the frame), bold / italic / links, with locked parts protected |
 | 📨 **Add to email** | Opens a new email, or fills the one you're writing |
@@ -226,6 +232,8 @@ Gmail decides a lot about how emails look. The engine tells you when something w
 - **Merge tags** like `{{Recipient.FirstName}}` from Salesforce aren't filled in by Gmail. The check warns you about them.
 - **Logos with a see-through background** can disappear in Gmail's dark mode. Export them on white.
 - **Over 102 KB, Gmail cuts the email.** The check shows the size and stops you at the limit.
+- **Images are limited to 1 MB** so emails load fast. The built-in image reducer makes a smaller copy in one step.
+- **Gmail decides the add-on panel's font and sizes.** The panel uses Gmail's own building blocks; the editor and other pages are fully styled.
 - The add-on runs in **Gmail on the web**. Gmail's phone apps don't show add-on side panels, but emails sent with it look right everywhere.
 
 ---

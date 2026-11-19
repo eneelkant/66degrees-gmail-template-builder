@@ -14,14 +14,15 @@
   ],
   "addOns": {
     "common": {
-      "name": "66° Template Gallery",
+      "name": "66\u00b0 Template Gallery",
       "logoUrl": "https://YOUR-ENGINE-URL.a.run.app/assets/icon.png",
       "layoutProperties": {
         "primaryColor": "#040A1B",
         "secondaryColor": "#0052FF"
       },
       "openLinkUrlPrefixes": [
-        "https://YOUR-ENGINE-URL.a.run.app/"
+        "https://YOUR-ENGINE-URL.a.run.app/",
+        "https://storage.googleapis.com/YOUR-IMAGE-BUCKET/"
       ],
       "homepageTrigger": {
         "runFunction": "onHomepage",
@@ -32,7 +33,7 @@
       "composeTrigger": {
         "selectActions": [
           {
-            "text": "66° Template Gallery",
+            "text": "66\u00b0 Template Gallery",
             "runFunction": "onCompose"
           }
         ],
